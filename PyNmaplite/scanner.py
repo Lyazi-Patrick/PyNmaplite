@@ -1,52 +1,137 @@
 import socket
-import threading
+import ssl
+import threading 
+from typing import List
 
-#Core TCP Port Scanner
-def scan_tcp_port(target:str,port: int, open_ports:list):
+class PortScanner:
     """
-    Scan a single TCP Port on the target host.
-    Args:
-    target (str): The target IP address or Hostname.
-    port (int): Port number to scan.
-    open_ports (list): Shared list to store open ports.
+    Simple class wrapper if you want object-oriented scanning later.
+    This  class currently stores target + range and can perform a quick a quick scan.
     """
-
+    def __init__(self,target: str, start_port: int = 1, end_port: int = 1024):
+        self.target = target
+        self.start_port = start_port
+        self.end_port = end_port
+    
+    def scan(self) -> dict:
+        """
+        Convenience method: run threaded scan and return dict {port:'open}.
+        """
+        open_ports = {}
+        ports = run_tcp_scan(self.target, self.start_port, self.end_port)
+        for p in ports:
+            open_ports[p] = "open"
+        return open_ports
+    
+def scan_tcp_port(target:str,port:int,open_ports:List[int]) -> None:
+    """
+    Worker to test a single TCP port using connect_ex (non-blocking error code)
+    Appends open ports to the shared open_ports list.
+    """
     try:
-        #Create a TCP socket
-        sock = socket.socket(socket.AF_INET,  socket.SOCK_STREAM)
-        sock.settimeout(1)# 1 second timeout for resposiveness
-        result = sock.connect_ex((target,port)) # 0 if port open
-
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1.0)
+        result = sock.connect_ex((target,port))
         if result == 0:
-            open_ports.append(port)#Save open port
+            open_ports.append(port)
         sock.close()
-    except Exception as e:
-        #Avoid crashing if something goes wrong
+    except Exception:
+        #ignore network errors for individual ports
         pass
 
-def run_tcp_scan(target:str, start_port:int, end_port: int):
+def run_tcp_scan(target:str, start_port:int, end_port:int) -> List[int]:
     """
-    Run a multi-threaded TCP port scan.
-
-    Args:
-        target (str): The target IP address or hostname.
-        start_port(int): Starting port number.
-        end_port (int): Ending port number.
-
-    Returns:
-        list: A list of open ports.
+    Multi-threaded TCP scan returning a sorted list of open ports.
     """
-    open_ports = []
-    threads = []
+    open_ports:List[int] = []
+    threads:List[threading.Thread] = []
 
-    for port in range(start_port, end_port + 1):
-        #Each port gets its own thread
-        t = threading.Thread(target = scan_tcp_port, args = (target, port,open_ports))
+    for port in range(start_port, end_port+1):
+        t = threading.Thread(target = scan_tcp_port, args = (target,open_ports))
+        t.daemon = True
         threads.append(t)
         t.start()
 
-    #Wait for all  threads to finish
+    #wait for all threads
     for t in threads:
         t.join()
-    
     return sorted(open_ports)
+
+def grab_banner(target:str, port:int) -> str:
+    """
+    Try to identify the service by asking for a banner or sending a minimal probe for common protocols.
+    Returns a short string, or "Unknown" on failure.
+    """
+    try:
+        #Basic TCP socket first
+        sock = socket.socket(socket.AF_INET, socket.ASOCK_STREAM)
+        sock.settimeout(2)
+        sock.connect((target, port))
+
+        #HTTP (plain) -> send an HTTP GET so server responds with headers
+        if port in (80, 8080):
+            http_req = f"GET/HTTP/1.1\r\nHost:{target}\r\nUser-Agent: PyNmaplite\r\nConnection:close\r\n\r\n"
+            sock.send(http_req.encode())
+            data = sock.recv(2048).decode(errors="ignore").strip()
+            sock.close()
+            # return first header line or a truncated header
+            lines = [l for l in data.splitlines() if l.strip()]
+            return lines[0] if lines else "HTTP (no header)"
+        
+        # HTTPS -> attempt simple SSL handshake and GET
+        if port == 443:
+            try:
+                context = ssl.create_default_context()
+                with context.wrap_socket(sock, server_hostname = target) as ssock:
+                    # send GET after handshake
+                    ssock.settimeout(2)
+                    ssock.send(b"GET/HTTP/1.1\r\nHost: " + target.encode() + b"\r\nConnection:close\r\n\r\n")
+                    data = ssock.recv(2048).decode(errors="ignore")
+                    lines = [l for l in data.splitlines() if l.strip()]
+                    return lines[0] if lines else "HTTPS (no header)"
+            except Exception:
+                #if SSL fails, ensure socket is closed and fall back
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                return "HTTPS (handshake failed)"
+            
+        #FTP usually sends banner immediately (port 21)
+        if port == 21:
+            data = sock.recv(2048).decode(errors="ignore").strip()
+            sock.close()
+            return data.splitlines()[0] if data else "FTP (no banner)"
+        
+        # SSH usually sends banner immediately (port 22)
+        if port == 22:
+            data = sock.recv(2048).decode(errors="ignore").strip()
+            sock.close()
+            return data.splitlines()[0] if data else "SSH (no bannner)"
+
+        # SMTP (25), POP3 (110), IMAP(143) often send initial banners
+        if port in (25,110,143):
+            data = sock.recv(2048).decode(errors = 'ignore').strip()
+            sock.close() 
+            return data.splitlines()[0] if data else "Service (no banner)"
+        
+        #Default attempt: try recv once (many services send a banner)
+        try:
+            data = sock.recv(2048).decode(erors="ignore").strip()
+            sock.close()
+            if data:
+                return data.splitlines()[0]
+        except socket.toimeout:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return "Unknown"
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return "Unknown"
+    except Exception:
+        return "Unknown"
