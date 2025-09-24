@@ -23,6 +23,8 @@ class PortScanner:
             open_ports[p] = "open"
         return open_ports
     
+lock = threading.Lock()    
+    
 def scan_tcp_port(target:str,port:int,open_ports:List[int]) -> None:
     """
     Worker to test a single TCP port using connect_ex (non-blocking error code)
@@ -33,7 +35,8 @@ def scan_tcp_port(target:str,port:int,open_ports:List[int]) -> None:
         sock.settimeout(1.0)
         result = sock.connect_ex((target,port))
         if result == 0:
-            open_ports.append(port)
+            with lock: #prevent race conditions 
+                open_ports.append(port)
         sock.close()
     except Exception:
         #ignore network errors for individual ports
@@ -46,8 +49,9 @@ def run_tcp_scan(target:str, start_port:int, end_port:int) -> List[int]:
     open_ports:List[int] = []
     threads:List[threading.Thread] = []
 
+    lock = threading.Lock()
     for port in range(start_port, end_port+1):
-        t = threading.Thread(target = scan_tcp_port, args = (target,open_ports))
+        t = threading.Thread(target = scan_tcp_port, args = (target,port,open_ports))
         t.daemon = True
         threads.append(t)
         t.start()
@@ -64,7 +68,7 @@ def grab_banner(target:str, port:int) -> str:
     """
     try:
         #Basic TCP socket first
-        sock = socket.socket(socket.AF_INET, socket.ASOCK_STREAM)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(2)
         sock.connect((target, port))
 
@@ -117,11 +121,11 @@ def grab_banner(target:str, port:int) -> str:
         
         #Default attempt: try recv once (many services send a banner)
         try:
-            data = sock.recv(2048).decode(erors="ignore").strip()
+            data = sock.recv(2048).decode(errors="ignore").strip()
             sock.close()
             if data:
                 return data.splitlines()[0]
-        except socket.toimeout:
+        except socket.timeout:
             try:
                 sock.close()
             except Exception:
